@@ -106,16 +106,31 @@ async function searchZingSong(query) {
     });
     const data = await resp.json();
     const items = data?.data?.items || [];
+    
+    // Ưu tiên chọn đúng bài hát đơn (type === 1 hoặc mã bài hát bắt đầu bằng Z hoặc I)
+    let fallback = null;
     for (const item of items) {
-      const songs = item?.suggestions || [];
-      if (songs.length > 0) {
-        return {
-          id: songs[0].id,
-          title: songs[0].title,
-          artist: songs[0].artistsNames || ""
-        };
+      const suggestions = item?.suggestions || [];
+      for (const s of suggestions) {
+        if (!s || !s.id) continue;
+        const idStr = String(s.id);
+        if (s.type === 1 || idStr.startsWith("Z") || idStr.startsWith("I")) {
+          return {
+            id: s.id,
+            title: s.title || query,
+            artist: s.artistsNames || ""
+          };
+        }
+        if (!fallback) {
+          fallback = {
+            id: s.id,
+            title: s.title || query,
+            artist: s.artistsNames || ""
+          };
+        }
       }
     }
+    return fallback;
   } catch (e) {
     console.error("[Zing] Search error:", e.message);
   }

@@ -1,8 +1,8 @@
 [
   {
-    "deviceName": "Bân Bân",
-    "wssUrl": "wss://api.xiaozhi.me/mcp/?token=eyJhbGciOiJFUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VySWQiOjg0NjI5OCwiYWdlbnRJZCI6MTU1MzQyMCwiZW5kcG9pbnRJZCI6ImFnZW50XzE1NTM0MjAiLCJwdXJwb3NlIjoibWNwLWVuZHBvaW50IiwiaWF0IjoxNzc1ODI4ODkwLCJleHAiOjE4MDczODY0OTB9.ea2PAiOOVOT_Yqpk-CNEMmZD8XZ-6t4HhlW_gSBwFiSPjjKvWmw1Tep21FDULwlWHbGhGWp2F57izdpsD0QzCw",
-    "savedAt": "2026-04-10T13:48:39.280Z",
+    "deviceName": "chatbox",
+    "wssUrl": "wss://api.xiaozhi.me/mcp/?token=eyJhbGciOiJFUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VySWQiOjk0MDA1NywiYWdlbnRJZCI6MjYyMTY0MSwiZW5kcG9pbnRJZCI6ImFnZW50XzI2MjE2NDEiLCJwdXJwb3NlIjoibWNwLWVuZHBvaW50IiwiaWF0IjoxNzk0NTc4MDc3LCJleHAiOjE4MjYxMzU2Nzd9.dKbfM6jnClH_vocif7FiwPeNMO6ENPsTlKlbkHtnY8H-tE21U5iI9wSBUarVl2ZnXXFYUhjPldaNo_1PQ_088Q",
+    "savedAt": "2026-11-13T14:15:00.000Z",
     "autoConnect": true
   }
 ]

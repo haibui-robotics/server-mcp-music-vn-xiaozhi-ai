@@ -1,7 +1,7 @@
 /**
- * MCP VN Music Server v3.0
- * Server kết nối WebSocket CLIENT tới Xiaozhi.me
- * Features: 80+ AI Tools + Music (Search, Play, Stream, Info, Lyrics)
+ * Xiaozhi Zing MP3 MCP Server - Cloud 24/7 Edition
+ * Native Zing MP3 HMAC-SHA512 direct resolver + Model Context Protocol
+ * Tương thích 100% với Chatbox Xiaozhi ESP32, Render.com, UptimeRobot.
  */
 
 const express = require("express");
@@ -9,16 +9,19 @@ const fetch   = require("node-fetch");
 const cors    = require("cors");
 const path    = require("path");
 const fs      = require("fs");
+const crypto  = require("crypto");
 const WebSocket = require("ws");
-const { v4: uuidv4 } = require("uuid");
-const { getAllBonionMCPTools, handleBonionToolCall, fetchBonionServers } = require("./tools");
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 app.use(express.static(path.join(__dirname, "public")));
 
-const BASE = "https://mp3.mrhung.io.vn";
+const ZING_VERSION = "1.6.34";
+const ZING_SECRET_KEY = "2aa2d1c561e809b267f3638c4a307aab";
+const ZING_API_KEY = "88265e23d4284f25963e6eedac8fbfa3";
+const RESOURCE_URI = "resource://read_from_http";
+const STREAM_DONE_FLAG = "[DONE]";
 
 // ─── Lưu thiết bị đang kết nối ────────────────────────────────────────────────
 const connectedDevices = new Map();
@@ -26,9 +29,6 @@ const connectedDevices = new Map();
 // ─── Persistent device storage ─────────────────────────────────────────────────
 const DEVICES_FILE = path.join(__dirname, "devices.json");
 
-/**
- * Đọc danh sách thiết bị đã lưu từ file
- */
 function loadSavedDevices() {
   try {
     if (fs.existsSync(DEVICES_FILE)) {
@@ -37,26 +37,20 @@ function loadSavedDevices() {
       if (Array.isArray(parsed)) return parsed;
     }
   } catch (e) {
-    console.error(`[storage] ❌ Lỗi đọc devices.json: ${e.message}`);
+    console.error(`[storage] Lỗi đọc devices.json: ${e.message}`);
   }
   return [];
 }
 
-/**
- * Lưu danh sách thiết bị ra file
- */
 function saveDevicesToFile(devices) {
   try {
     fs.writeFileSync(DEVICES_FILE, JSON.stringify(devices, null, 2), "utf-8");
     console.log(`[storage] 💾 Đã lưu ${devices.length} thiết bị vào devices.json`);
   } catch (e) {
-    console.error(`[storage] ❌ Lỗi ghi devices.json: ${e.message}`);
+    console.error(`[storage] Lỗi ghi devices.json: ${e.message}`);
   }
 }
 
-/**
- * Thêm/cập nhật thiết bị vào danh sách lưu
- */
 function addSavedDevice(deviceName, wssUrl) {
   const devices = loadSavedDevices();
   const idx = devices.findIndex(d => d.deviceName === deviceName);
@@ -74,9 +68,6 @@ function addSavedDevice(deviceName, wssUrl) {
   saveDevicesToFile(devices);
 }
 
-/**
- * Xóa thiết bị khỏi danh sách lưu
- */
 function removeSavedDevice(deviceName) {
   const devices = loadSavedDevices();
   const filtered = devices.filter(d => d.deviceName !== deviceName);
@@ -84,36 +75,141 @@ function removeSavedDevice(deviceName) {
   return filtered.length < devices.length;
 }
 
-/**
- * Cập nhật trạng thái autoConnect
- */
-function updateAutoConnect(deviceName, autoConnect) {
-  const devices = loadSavedDevices();
-  const dev = devices.find(d => d.deviceName === deviceName);
-  if (dev) {
-    dev.autoConnect = autoConnect;
-    saveDevicesToFile(devices);
-    return true;
+// ─── Zing MP3 Native Resolver ─────────────────────────────────────────────────
+let zingCookie = "";
+let zingCookieTime = 0;
+
+async function ensureZingCookie() {
+  if (!zingCookie || (Date.now() - zingCookieTime > 1800000)) {
+    try {
+      const resp = await fetch("https://zingmp3.vn", {
+        headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" },
+        timeout: 6000
+      });
+      const rawCookies = resp.headers.raw() ? resp.headers.raw()["set-cookie"] : null;
+      if (rawCookies && rawCookies.length > 0) {
+        zingCookie = rawCookies.map(c => c.split(";")[0]).join("; ");
+        zingCookieTime = Date.now();
+      }
+    } catch (e) {
+      console.warn("[Zing] Cookie warning:", e.message);
+    }
   }
-  return false;
 }
 
-// ─── MCP Tool definitions ──────────────────────────────────────────────────────
-const MCP_TOOLS = [
+async function searchZingSong(query) {
+  try {
+    const url = `https://ac.zingmp3.vn/v1/web/ac-suggestions?query=${encodeURIComponent(query)}`;
+    const resp = await fetch(url, {
+      headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" },
+      timeout: 6000
+    });
+    const data = await resp.json();
+    const items = data?.data?.items || [];
+    for (const item of items) {
+      const songs = item?.suggestions || [];
+      if (songs.length > 0) {
+        return {
+          id: songs[0].id,
+          title: songs[0].title,
+          artist: songs[0].artistsNames || ""
+        };
+      }
+    }
+  } catch (e) {
+    console.error("[Zing] Search error:", e.message);
+  }
+  return null;
+}
+
+async function getZingStreamUrl(songId) {
+  await ensureZingCookie();
+  const ctime = Math.floor(Date.now() / 1000).toString();
+  const path = "/api/v2/song/get/streaming";
+  const msg = `ctime=${ctime}id=${songId}version=${ZING_VERSION}`;
+  const hash256 = crypto.createHash("sha256").update(msg, "utf8").digest("hex");
+  const sig = crypto.createHmac("sha512", ZING_SECRET_KEY).update(path + hash256, "utf8").digest("hex");
+  const url = `https://zingmp3.vn${path}?id=${songId}&ctime=${ctime}&version=${ZING_VERSION}&apiKey=${ZING_API_KEY}&sig=${sig}`;
+
+  try {
+    const resp = await fetch(url, {
+      headers: {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+        "Cookie": zingCookie
+      },
+      timeout: 8000
+    });
+    const data = await resp.json();
+    if (data?.err === 0 && data?.data) {
+      const audioUrl = data.data["128"] || data.data["320"];
+      if (audioUrl) {
+        try {
+          const redResp = await fetch(audioUrl, {
+            headers: { "User-Agent": "Mozilla/5.0", "Range": "bytes=0-10" },
+            redirect: "follow",
+            timeout: 5000
+          });
+          return redResp.url || audioUrl;
+        } catch (_) {
+          return audioUrl;
+        }
+      }
+    }
+  } catch (e) {
+    console.error("[Zing] Stream URL error:", e.message);
+  }
+  return "";
+}
+
+async function readHttpChunk(url, start = 0, end = 0) {
+  if (end <= start) end = start + 100 * 1024;
+  try {
+    const resp = await fetch(url, {
+      headers: {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+        "Range": `bytes=${start}-${end - 1}`,
+        "Accept": "*/*"
+      },
+      timeout: 15000
+    });
+    if (resp.status === 416) {
+      return Buffer.from(STREAM_DONE_FLAG).toString("base64");
+    }
+    const buf = await resp.buffer();
+    if (!buf || buf.length === 0) {
+      return Buffer.from(STREAM_DONE_FLAG).toString("base64");
+    }
+    return buf.toString("base64");
+  } catch (e) {
+    return Buffer.from(STREAM_DONE_FLAG).toString("base64");
+  }
+}
+
+// ─── MCP Definitions ──────────────────────────────────────────────────────────
+const TOOLS_LIST = [
   {
-    name: "search_music",
-    description: "Tìm kiếm bài hát, ca sĩ nhạc Việt. Trả về danh sách bài hát có encodeId để phát nhạc.",
+    name: "play_song",
+    description: "Phát bài hát Việt Nam hoặc quốc tế được yêu cầu ra loa thiết bị. BẮT BUỘC dùng công cụ này khi người dùng muốn nghe nhạc hoặc mở bài hát.",
     inputSchema: {
       type: "object",
       properties: {
         query: {
           type: "string",
-          description: "Tên bài hát hoặc ca sĩ cần tìm. Ví dụ: 'sơn tùng', 'lạc trôi'"
-        },
-        limit: {
-          type: "number",
-          description: "Số kết quả (mặc định 5, tối đa 10)",
-          default: 5
+          description: "Tên bài hát hoặc tên ca sĩ cần phát (ví dụ: 'Một con vịt', 'Cắt Đôi Nỗi Sầu', 'Lạc Trôi Sơn Tùng')"
+        }
+      },
+      required: ["query"]
+    }
+  },
+  {
+    name: "search_song",
+    description: "Tìm kiếm bài hát hoặc danh sách ca khúc Việt Nam",
+    inputSchema: {
+      type: "object",
+      properties: {
+        query: {
+          type: "string",
+          description: "Từ khóa bài hát hoặc ca sĩ cần tìm"
         }
       },
       required: ["query"]
@@ -121,266 +217,95 @@ const MCP_TOOLS = [
   },
   {
     name: "play_music",
-    description: "Lấy link stream nhạc để phát. Trả về streamUrl là direct MP3 link.",
+    description: "Phát bài hát Việt Nam hoặc quốc tế ra loa thiết bị",
     inputSchema: {
       type: "object",
       properties: {
-        encodeId: {
-          type: "string",
-          description: "Mã bài hát encodeId từ kết quả search_music"
-        },
-        title:  { type: "string", description: "Tên bài hát" },
-        artist: { type: "string", description: "Tên ca sĩ" }
+        query: { type: "string", description: "Tên bài hát hoặc tên ca sĩ cần phát" }
       },
-      required: ["encodeId"]
+      required: ["query"]
     }
   },
   {
-    name: "get_stream_url",
-    description: "Lấy link stream trực tiếp (direct MP3 URL) để phát nhạc. Trả về URL có thể dùng trực tiếp trong trình phát nhạc.",
+    name: "search_music",
+    description: "Tìm kiếm bài hát hoặc ca khúc Việt Nam",
     inputSchema: {
       type: "object",
       properties: {
-        encodeId: {
-          type: "string",
-          description: "Mã bài hát encodeId từ kết quả search_music"
-        }
+        query: { type: "string", description: "Từ khóa bài hát cần tìm" }
       },
-      required: ["encodeId"]
-    }
-  },
-  {
-    name: "get_song_info",
-    description: "Lấy thông tin chi tiết bài hát: tên, ca sĩ, album, thể loại, nhạc sĩ sáng tác, thời lượng, ảnh bìa, lượt thích, v.v.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        encodeId: {
-          type: "string",
-          description: "Mã bài hát encodeId từ kết quả search_music"
-        }
-      },
-      required: ["encodeId"]
-    }
-  },
-  {
-    name: "get_lyrics",
-    description: "Lấy lời bài hát (lyrics) bao gồm cả lời có đồng bộ thời gian (synced lyrics) và lời plain text.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        encodeId: {
-          type: "string",
-          description: "Mã bài hát encodeId từ kết quả search_music"
-        }
-      },
-      required: ["encodeId"]
-    }
-  },
-  {
-    name: "get_top_charts",
-    description: "Lấy danh sách bài hát đang hot/trending trên Zing MP3 Việt Nam.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        limit: { type: "number", description: "Số bài (mặc định 10)", default: 10 }
-      }
+      required: ["query"]
     }
   }
 ];
 
-// ─── Tool handlers ─────────────────────────────────────────────────────────────
-async function handleSearchMusic({ query, limit = 5 }) {
-  const n = Math.min(limit, 10);
-  const r = await fetch(`${BASE}/api/search?q=${encodeURIComponent(query)}`);
-  const data = await r.json();
-  const songs = (data?.data?.songs || []).slice(0, n).map(s => ({
-    title:     s.title,
-    artist:    s.artistsNames,
-    album:     s.album?.title || "",
-    duration:  formatDur(s.duration),
-    encodeId:  s.encodeId,
-    thumbnail: s.thumbnailM || "",
-    streamUrl: `${BASE}/api/song/stream?id=${s.encodeId}`
-  }));
-  return songs.length
-    ? { message: `Tìm thấy ${songs.length} bài cho "${query}"`, songs }
-    : { message: `Không tìm thấy "${query}"`, songs: [] };
-}
-
-async function getDirectStreamUrl(encodeId) {
-  const proxyUrl = `${BASE}/api/song/stream?id=${encodeId}`;
-  try {
-    const resp = await fetch(proxyUrl, { redirect: "manual" });
-    const loc  = resp.headers.get("location");
-    if (loc) return loc;
-  } catch (e) {
-    console.error(`[getDirectStreamUrl] Lỗi: ${e.message}`);
+const RESOURCES_LIST = [
+  {
+    uri: RESOURCE_URI,
+    name: "HTTP Audio Stream",
+    description: "Hỗ trợ stream âm thanh trực tiếp từ URL qua HTTP Range chunking cho Xiaozhi",
+    mimeType: "application/octet-stream"
   }
-  return proxyUrl;
-}
+];
 
-async function handlePlayMusic({ encodeId, title, artist }) {
-  const streamUrl = await getDirectStreamUrl(encodeId);
-  const songName  = title ? `${title}${artist ? ` - ${artist}` : ""}` : encodeId;
+async function handleToolCall(toolName, args) {
+  const query = args?.query || args?.song_name || args?.song || args?.title || "";
+  console.log(`[Tool] Gọi '${toolName}' với từ khóa: '${query}'`);
 
-  console.log(`[play_music] 🎵 ${songName}`);
-  console.log(`[play_music] 🔗 ${streamUrl}`);
-
-  return {
-    encodeId,
-    streamUrl,
-    title:   title  || "",
-    artist:  artist || "",
-    message: `🎵 Bài: ${songName}\nStream: ${streamUrl}`
-  };
-}
-
-async function handleGetStreamUrl({ encodeId }) {
-  const streamUrl = await getDirectStreamUrl(encodeId);
-  const proxyUrl  = `${BASE}/api/song/stream?id=${encodeId}`;
-
-  console.log(`[get_stream_url] 🔗 ${encodeId} → ${streamUrl}`);
-
-  return {
-    encodeId,
-    streamUrl,
-    proxyUrl,
-    message: `🔗 Link stream cho ${encodeId}:\n- Direct: ${streamUrl}\n- Proxy: ${proxyUrl}`
-  };
-}
-
-async function handleGetSongInfo({ encodeId }) {
-  const r = await fetch(`${BASE}/api/info-song?id=${encodeId}`);
-  const data = await r.json();
-
-  if (data.err !== 0 || !data.data) {
-    return { error: `Không tìm thấy thông tin bài hát: ${encodeId}`, encodeId };
-  }
-
-  const s = data.data;
-  const info = {
-    encodeId:    s.encodeId,
-    title:       s.title,
-    artist:      s.artistsNames,
-    artists:     (s.artists || []).map(a => ({ name: a.name, id: a.id, thumbnail: a.thumbnail, followers: a.totalFollow })),
-    album:       s.album ? { title: s.album.title, releaseDate: s.album.releaseDate } : null,
-    genres:      (s.genres || []).map(g => g.name),
-    composers:   (s.composers || []).map(c => c.name),
-    duration:    formatDur(s.duration),
-    durationSec: s.duration,
-    thumbnail:   s.thumbnailM || s.thumbnail || "",
-    releaseDate: s.releaseDate ? new Date(s.releaseDate * 1000).toLocaleDateString("vi-VN") : "",
-    hasLyric:    s.hasLyric || false,
-    like:        s.like || 0,
-    comment:     s.comment || 0,
-    streamUrl:   `${BASE}/api/song/stream?id=${s.encodeId}`
-  };
-
-  console.log(`[get_song_info] ℹ️ ${info.title} - ${info.artist}`);
-
-  return {
-    ...info,
-    message: `ℹ️ ${info.title} - ${info.artist}\n🎵 Album: ${info.album?.title || 'N/A'}\n🎹 Thể loại: ${info.genres.join(', ')}\n✍️ Sáng tác: ${info.composers.join(', ')}\n⏱️ Thời lượng: ${info.duration}\n❤️ ${info.like.toLocaleString()} lượt thích`
-  };
-}
-
-async function handleGetLyrics({ encodeId }) {
-  const r = await fetch(`${BASE}/api/lyric?id=${encodeId}`);
-  const data = await r.json();
-
-  if (data.err !== 0 || !data.data) {
-    return { error: `Không tìm thấy lời bài hát: ${encodeId}`, encodeId, hasLyric: false };
-  }
-
-  const lrcUrl = data.data.file || "";
-  let plainText = "";
-  let syncedLyrics = [];
-
-  // Tải và parse file .lrc nếu có
-  if (lrcUrl) {
-    try {
-      const lrcResp = await fetch(lrcUrl);
-      const lrcContent = await lrcResp.text();
-
-      // Parse LRC format
-      const lines = lrcContent.split(/\r?\n/);
-      const textLines = [];
-
-      for (const line of lines) {
-        const match = line.match(/^\[(\d{2}):(\d{2}\.\d{2})\](.*)$/);
-        if (match) {
-          const minutes = parseInt(match[1]);
-          const seconds = parseFloat(match[2]);
-          const text = match[3].trim();
-          if (text) {
-            syncedLyrics.push({
-              time: `${match[1]}:${match[2]}`,
-              timeSec: minutes * 60 + seconds,
-              text
-            });
-            textLines.push(text);
-          }
-        } else if (line.startsWith("[") && line.includes("]")) {
-          // Metadata lines like [ar:], [ti:], etc.
-          const metaMatch = line.match(/^\[([a-z]+):\s*(.+)\]$/i);
-          if (metaMatch) {
-            // Skip metadata in plain text
-          }
-        }
-      }
-
-      plainText = textLines.join("\n");
-    } catch (e) {
-      console.error(`[get_lyrics] Lỗi tải LRC: ${e.message}`);
+  if (toolName === "play_song" || toolName === "play_music" || toolName === "self.music.play_song") {
+    if (!query) {
+      return { content: [{ type: "text", text: "Vui lòng cho tôi biết tên bài hát bạn muốn nghe." }] };
     }
+    const song = await searchZingSong(query);
+    if (!song) {
+      return { content: [{ type: "text", text: `Không tìm thấy bài hát '${query}' trên Zing MP3.` }] };
+    }
+    const displayName = song.artist ? `${song.title} - ${song.artist}` : song.title;
+    console.log(`[Zing] Tìm thấy: ${displayName} (ID: ${song.id}). Đang lấy link stream...`);
+    
+    const streamUrl = await getZingStreamUrl(song.id);
+    if (!streamUrl) {
+      return { content: [{ type: "text", text: `Bài hát '${displayName}' hiện không thể phát do bản quyền.` }] };
+    }
+    console.log(`[Zing] Link stream: ${streamUrl.substring(0, 60)}...`);
+
+    return {
+      content: [
+        {
+          type: "text",
+          text: `Đã tìm thấy bài hát '${displayName}'. Link stream: ${streamUrl}\nBẮT BUỘC hãy gọi ngay công cụ thiết bị self.music.play_song với tham số url='${streamUrl}' và song_name='${displayName}' để phát ra loa.`
+        },
+        {
+          type: "resource_link",
+          uri: RESOURCE_URI,
+          name: displayName,
+          description: streamUrl,
+          mimeType: "audio/mpeg"
+        }
+      ]
+    };
+  } else if (toolName === "search_song" || toolName === "search_music") {
+    const song = await searchZingSong(query);
+    if (song) {
+      return { content: [{ type: "text", text: `Tìm thấy bài hát: ${song.title} - ${song.artist}` }] };
+    }
+    return { content: [{ type: "text", text: `Không tìm thấy bài hát '${query}'.` }] };
   }
 
-  console.log(`[get_lyrics] 📝 ${encodeId} - ${syncedLyrics.length} dòng`);
-
-  return {
-    encodeId,
-    hasLyric: true,
-    lrcUrl,
-    plainText,
-    syncedLyrics,
-    totalLines: syncedLyrics.length,
-    message: plainText
-      ? `📝 Lời bài hát (${syncedLyrics.length} dòng):\n\n${plainText}`
-      : `Không có lời bài hát cho ${encodeId}`
-  };
+  return { content: [{ type: "text", text: `Công cụ ${toolName} không tồn tại.` }], isError: true };
 }
 
-async function handleGetTopCharts({ limit = 10 }) {
-  const r = await fetch(`${BASE}/api/search?q=nhạc+hot+2024`);
-  const data = await r.json();
-  const charts = (data?.data?.songs || []).slice(0, Math.min(limit, 10)).map((s, i) => ({
-    rank:     i + 1,
-    title:    s.title,
-    artist:   s.artistsNames,
-    duration: formatDur(s.duration),
-    encodeId: s.encodeId,
-    streamUrl: `${BASE}/api/song/stream?id=${s.encodeId}`
-  }));
-  return { message: `🔥 Top ${charts.length} bài hot`, charts };
-}
-
-function formatDur(s) {
-  if (!s) return "?";
-  return `${Math.floor(s / 60)}:${(s % 60).toString().padStart(2, "0")}`;
-}
-
-// ─── Xử lý message từ Xiaozhi ─────────────────────────────────────────────────
+// ─── WebSocket Client tới Xiaozhi ─────────────────────────────────────────────
 async function handleXiaozhiMessage(ws, raw, deviceName) {
-  // Bỏ qua binary frames (audio từ device)
-  if (Buffer.isBuffer(raw) && !isJsonBuffer(raw)) return;
-
   let msg;
-  try { msg = JSON.parse(raw.toString()); } catch { return; }
+  try {
+    msg = JSON.parse(raw.toString());
+  } catch {
+    return;
+  }
 
   const { id, method, params } = msg;
-  if (!method) return;
-  if (method.startsWith("notifications/")) return;
+  if (!method || method.startsWith("notifications/")) return;
 
   console.log(`[${deviceName}] ← ${method}`);
 
@@ -391,401 +316,180 @@ async function handleXiaozhiMessage(ws, raw, deviceName) {
     if (method === "initialize") {
       result = {
         protocolVersion: "2024-11-05",
-        capabilities:    { tools: { listChanged: false } },
-        serverInfo:      { name: "vn-music-mcp", version: "3.0.0" }
+        capabilities: { tools: {}, resources: {} },
+        serverInfo: { name: "xiaozhi-vn-music-streamer", version: "3.5.0" }
       };
-
     } else if (method === "tools/list") {
-      // Merge music tools + 80+ bonion tools
-      // OPTIMIZED: Loại bỏ inputSchema để giảm kích thước response (fix code 1009)
-      const bonionTools = await getAllBonionMCPTools();
-      const toolsList = [...MCP_TOOLS, ...bonionTools].map(t => ({
-        name: t.name,
-        description: t.description
-      }));
-      result = { tools: toolsList };
-
+      result = { tools: TOOLS_LIST };
+    } else if (method === "resources/list") {
+      result = { resources: RESOURCES_LIST };
+    } else if (method === "resources/read") {
+      const args = params?.arguments || {};
+      const url = args.url || "";
+      const start = parseInt(args.start || 0, 10);
+      const end = parseInt(args.end || 0, 10);
+      const blob = await readHttpChunk(url, start, end);
+      result = {
+        contents: [
+          {
+            uri: RESOURCE_URI,
+            mimeType: "application/octet-stream",
+            blob: blob
+          }
+        ]
+      };
     } else if (method === "tools/call") {
-      const { name, arguments: args } = params;
-      let toolResult;
-
-      // Music tools (local handlers)
-      if      (name === "search_music")   toolResult = await handleSearchMusic(args);
-      else if (name === "play_music")     toolResult = await handlePlayMusic(args);
-      else if (name === "get_stream_url") toolResult = await handleGetStreamUrl(args);
-      else if (name === "get_song_info")  toolResult = await handleGetSongInfo(args);
-      else if (name === "get_lyrics")     toolResult = await handleGetLyrics(args);
-      else if (name === "get_top_charts") toolResult = await handleGetTopCharts(args);
-      // Bonion tools (fallback to bonion handler)
-      else toolResult = await handleBonionToolCall(name, args);
-
-      result = { content: [{ type: "text", text: JSON.stringify(toolResult, null, 2) }] };
-
+      const toolName = params?.name;
+      const args = params?.arguments || {};
+      result = await handleToolCall(toolName, args);
     } else if (method === "ping") {
       result = {};
     } else {
       error = { code: -32601, message: `Method not found: ${method}` };
     }
   } catch (e) {
-    console.error(`[${deviceName}] ❌ Lỗi:`, e.message);
+    console.error(`[${deviceName}] Lỗi xử lý:`, e.message);
     error = { code: -32603, message: e.message };
   }
 
   if (id !== undefined && id !== null) {
     const response = { jsonrpc: "2.0", id };
     if (error) response.error = error;
-    else       response.result = result;
+    else response.result = result;
     ws.send(JSON.stringify(response));
     console.log(`[${deviceName}] → ${method} OK`);
   }
 }
 
-function isJsonBuffer(buf) {
-  // Kiểm tra buffer có phải JSON không (bắt đầu bằng { hoặc [)
-  const first = buf[0];
-  return first === 0x7B || first === 0x5B; // '{' or '['
-}
-
-// ─── WebSocket Client tới Xiaozhi ─────────────────────────────────────────────
 function connectToXiaozhi(deviceName, wssUrl) {
-  const device = connectedDevices.get(deviceName);
-  if (device?.ws && device.ws.readyState === WebSocket.OPEN) device.ws.close();
-  if (device?.reconnectTimer) clearTimeout(device.reconnectTimer);
+  const existing = connectedDevices.get(deviceName);
+  if (existing?.ws && existing.ws.readyState === WebSocket.OPEN) {
+    try { existing.ws.close(); } catch (_) {}
+  }
+  if (existing?.reconnectTimer) {
+    clearTimeout(existing.reconnectTimer);
+  }
 
-  console.log(`[WSS] Đang kết nối tới Xiaozhi: ${deviceName}`);
-
-  const ws = new WebSocket(wssUrl, {
-    headers: {
-      "User-Agent": "VN-Music-MCP/1.2",
-      "Accept":     "application/json"
-    }
+  console.log(`[WSS] Đang kết nối tới Xiaozhi (${deviceName}): ${wssUrl.substring(0, 35)}...`);
+  const ws = new WebSocket(wssUrl);
+  connectedDevices.set(deviceName, {
+    ws,
+    url: wssUrl,
+    status: "connecting",
+    connectedAt: null,
+    reconnectTimer: null
   });
-
-  connectedDevices.set(deviceName, { ws, url: wssUrl, connectedAt: null, status: "connecting", reconnectTimer: null });
 
   ws.on("open", () => {
     const dev = connectedDevices.get(deviceName);
-    if (dev) { dev.status = "connected"; dev.connectedAt = new Date().toISOString(); }
-    console.log(`[WSS] ✅ Đã kết nối: ${deviceName}`);
+    if (dev) {
+      dev.status = "connected";
+      dev.connectedAt = new Date().toISOString();
+    }
+    console.log(`[WSS] >>> KẾT NỐI THÀNH CÔNG (${deviceName})! Trạng thái: TRỰC TUYẾN.`);
   });
 
   ws.on("message", (data) => handleXiaozhiMessage(ws, data, deviceName));
 
-  ws.on("close", (code) => {
+  ws.on("close", (code, reason) => {
     const dev = connectedDevices.get(deviceName);
     if (dev) dev.status = "disconnected";
-    console.log(`[WSS] ❌ Ngắt kết nối: ${deviceName} (code ${code})`);
-
-    if (code === 4004) {
-      console.error(`[WSS] ⛔ Code 4004 = Token không hợp lệ hoặc session hết hạn. Hãy cập nhật wssUrl.`);
-      // Không reconnect khi token lỗi
-      return;
-    }
-
+    console.warn(`[WSS] Ngắt kết nối (${deviceName}) code=${code}. Thử lại sau 5s...`);
     const timer = setTimeout(() => {
       if (connectedDevices.has(deviceName)) {
-        console.log(`[WSS] 🔄 Reconnect: ${deviceName}`);
         connectToXiaozhi(deviceName, wssUrl);
       }
-    }, 10000);
-
-    if (connectedDevices.has(deviceName)) connectedDevices.get(deviceName).reconnectTimer = timer;
+    }, 5000);
+    if (dev) dev.reconnectTimer = timer;
   });
 
   ws.on("error", (err) => {
-    const dev = connectedDevices.get(deviceName);
-    if (dev) dev.status = "error";
-    console.error(`[WSS] ⚠️ Lỗi: ${deviceName}: ${err.message}`);
+    console.error(`[WSS] Lỗi kết nối (${deviceName}):`, err.message);
   });
 
   return ws;
 }
 
 // ─── REST API ─────────────────────────────────────────────────────────────────
-app.post("/api/connect", (req, res) => {
-  const { deviceName, wssUrl, saveDevice, reconnect } = req.body;
-
-  // Reconnect mode: lấy wssUrl từ saved devices
-  if (reconnect && deviceName) {
-    const saved = loadSavedDevices();
-    const dev = saved.find(d => d.deviceName === deviceName);
-    if (!dev) return res.status(404).json({ error: `Không tìm thấy thiết bị "${deviceName}" trong danh sách lưu` });
-
-    try {
-      const ws = connectToXiaozhi(deviceName, dev.wssUrl);
-      const timeout = setTimeout(() => {
-        if (!res.headersSent) res.status(504).json({ error: "Timeout kết nối sau 8s" });
-      }, 8000);
-      ws.once("open", () => { clearTimeout(timeout); if (!res.headersSent) res.json({ success: true, message: `✅ Đã kết nối lại "${deviceName}"!` }); });
-      ws.once("error", (err) => { clearTimeout(timeout); if (!res.headersSent) res.status(500).json({ error: err.message }); });
-    } catch (err) {
-      res.status(500).json({ error: err.message });
-    }
-    return;
-  }
-
-  if (!deviceName || !wssUrl)
-    return res.status(400).json({ error: "Thiếu deviceName hoặc wssUrl" });
-  if (!wssUrl.startsWith("wss://"))
-    return res.status(400).json({ error: "wssUrl phải bắt đầu bằng wss://" });
-
-  try {
-    const trimName = deviceName.trim();
-    const trimUrl  = wssUrl.trim();
-    const ws = connectToXiaozhi(trimName, trimUrl);
-    const timeout = setTimeout(() => {
-      if (!res.headersSent) res.status(504).json({ error: "Timeout kết nối Xiaozhi sau 8s" });
-    }, 8000);
-    ws.once("open",  () => {
-      clearTimeout(timeout);
-      // Tự động lưu thiết bị khi kết nối thành công (mặc định saveDevice = true)
-      if (saveDevice !== false) {
-        addSavedDevice(trimName, trimUrl);
-      }
-      if (!res.headersSent) res.json({ success: true, message: `✅ Đã kết nối "${trimName}"!`, saved: saveDevice !== false });
+app.get("/api/devices", (req, res) => {
+  const list = [];
+  for (const [name, d] of connectedDevices.entries()) {
+    list.push({
+      name,
+      status: d.status,
+      connectedAt: d.connectedAt,
+      url: d.url ? d.url.replace(/token=.*$/, "token=***") : ""
     });
-    ws.once("error", (err) => { clearTimeout(timeout); if (!res.headersSent) res.status(500).json({ error: err.message }); });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
   }
+  res.json({ devices: list });
+});
+
+app.get("/api/saved-devices", (req, res) => {
+  const saved = loadSavedDevices();
+  const result = saved.map(d => {
+    const conn = connectedDevices.get(d.deviceName);
+    return {
+      ...d,
+      wssUrl: d.wssUrl ? d.wssUrl.replace(/token=.*$/, "token=***") : "",
+      isConnected: conn?.status === "connected"
+    };
+  });
+  res.json({ savedDevices: result, total: result.length });
+});
+
+app.post("/api/connect", (req, res) => {
+  const { deviceName, wssUrl } = req.body;
+  if (!deviceName || !wssUrl) {
+    return res.status(400).json({ error: "Thiếu deviceName hoặc wssUrl" });
+  }
+  addSavedDevice(deviceName, wssUrl);
+  connectToXiaozhi(deviceName, wssUrl);
+  res.json({ success: true, message: `Đã bắt đầu kết nối "${deviceName}"`, saved: true });
 });
 
 app.post("/api/disconnect", (req, res) => {
   const { deviceName, removeFromSaved } = req.body;
   const dev = connectedDevices.get(deviceName);
-  if (!dev) return res.json({ message: "Thiết bị không tồn tại" });
-  if (dev.reconnectTimer) clearTimeout(dev.reconnectTimer);
-  if (dev.ws)             dev.ws.close();
+  if (dev?.reconnectTimer) clearTimeout(dev.reconnectTimer);
+  if (dev?.ws) try { dev.ws.close(); } catch (_) {}
   connectedDevices.delete(deviceName);
-  // Nếu yêu cầu xóa khỏi danh sách lưu
-  if (removeFromSaved) {
-    removeSavedDevice(deviceName);
-  }
-  res.json({ success: true, message: `Đã ngắt kết nối "${deviceName}"`, removedFromSaved: !!removeFromSaved });
-});
-
-app.get("/api/devices", (req, res) => {
-  const list = [];
-  connectedDevices.forEach((dev, name) => {
-    list.push({ name, status: dev.status, connectedAt: dev.connectedAt,
-                url: dev.url.replace(/token=.{10,}/, "token=***") });
-  });
-  res.json({ devices: list });
-});
-
-// ─── Saved Devices API ────────────────────────────────────────────────────────
-app.get("/api/saved-devices", (req, res) => {
-  const saved = loadSavedDevices().map(d => ({
-    ...d,
-    wssUrl: d.wssUrl.replace(/token=.{10,}/, "token=***"),
-    isConnected: connectedDevices.has(d.deviceName) && connectedDevices.get(d.deviceName).status === "connected"
-  }));
-  res.json({ savedDevices: saved, total: saved.length });
-});
-
-app.post("/api/save-device", (req, res) => {
-  const { deviceName, wssUrl } = req.body;
-  if (!deviceName || !wssUrl)
-    return res.status(400).json({ error: "Thiếu deviceName hoặc wssUrl" });
-  addSavedDevice(deviceName.trim(), wssUrl.trim());
-  res.json({ success: true, message: `💾 Đã lưu thiết bị "${deviceName}"` });
+  if (removeFromSaved) removeSavedDevice(deviceName);
+  res.json({ success: true, message: `Đã ngắt kết nối "${deviceName}"` });
 });
 
 app.post("/api/remove-saved-device", (req, res) => {
   const { deviceName } = req.body;
-  if (!deviceName)
-    return res.status(400).json({ error: "Thiếu deviceName" });
-  const removed = removeSavedDevice(deviceName);
-  if (removed) {
-    res.json({ success: true, message: `🗑️ Đã xóa "${deviceName}" khỏi danh sách lưu` });
-  } else {
-    res.json({ success: false, message: `Không tìm thấy "${deviceName}" trong danh sách lưu` });
-  }
+  if (!deviceName) return res.status(400).json({ error: "Thiếu deviceName" });
+  removeSavedDevice(deviceName);
+  const dev = connectedDevices.get(deviceName);
+  if (dev?.reconnectTimer) clearTimeout(dev.reconnectTimer);
+  if (dev?.ws) try { dev.ws.close(); } catch (_) {}
+  connectedDevices.delete(deviceName);
+  res.json({ success: true, message: `Đã xóa "${deviceName}" khỏi danh sách lưu` });
 });
 
-app.post("/api/toggle-auto-connect", (req, res) => {
-  const { deviceName, autoConnect } = req.body;
-  if (!deviceName)
-    return res.status(400).json({ error: "Thiếu deviceName" });
-  const updated = updateAutoConnect(deviceName, autoConnect);
-  if (updated) {
-    res.json({ success: true, message: `${autoConnect ? '✅' : '⏸️'} AutoConnect ${autoConnect ? 'bật' : 'tắt'} cho "${deviceName}"` });
-  } else {
-    res.json({ success: false, message: `Không tìm thấy "${deviceName}" trong danh sách lưu` });
-  }
-});
-
-app.post("/api/reconnect-all", async (req, res) => {
-  const saved = loadSavedDevices();
-  const toConnect = saved.filter(d => d.autoConnect !== false);
-
-  if (toConnect.length === 0) {
-    return res.json({ success: false, message: "Không có thiết bị nào để kết nối lại" });
-  }
-
-  let connected = 0;
-  let failed = 0;
-
-  for (const dev of toConnect) {
-    try {
-      // Bỏ qua nếu đã kết nối
-      const existing = connectedDevices.get(dev.deviceName);
-      if (existing && existing.status === "connected") {
-        connected++;
-        continue;
-      }
-      connectToXiaozhi(dev.deviceName, dev.wssUrl);
-      connected++;
-      // Delay giữa các kết nối
-      await new Promise(r => setTimeout(r, 1000));
-    } catch (e) {
-      console.error(`[reconnect-all] ❌ ${dev.deviceName}: ${e.message}`);
-      failed++;
-    }
-  }
-
-  res.json({
-    success: true,
-    message: `🔄 Đã gửi kết nối lại ${connected}/${toConnect.length} thiết bị${failed ? ` (${failed} lỗi)` : ''}`,
-    connected,
-    failed,
-    total: toConnect.length
-  });
-});
-
-app.get("/api", async (req, res) => {
-  const bonionTools = await getAllBonionMCPTools();
-  const allTools = [...MCP_TOOLS, ...bonionTools];
-  res.json({ name: "VN Music MCP", version: "3.0.0",
-             connectedDevices: connectedDevices.size,
-             totalTools: allTools.length,
-             musicTools: MCP_TOOLS.length,
-             bonionTools: bonionTools.length,
-             tools: allTools.map(t => ({ name: t.name, description: t.description })) });
-});
-
-// REST API: Danh sách tools
-app.get("/api/tools", async (req, res) => {
-  const bonionTools = await getAllBonionMCPTools();
-  res.json({ total: MCP_TOOLS.length + bonionTools.length,
-             music: MCP_TOOLS,
-             bonion: bonionTools });
-});
-
+// REST API Search endpoint
 app.get("/search", async (req, res) => {
-  const q = req.query.q;
+  const q = req.query.q || "";
   if (!q) return res.json({ error: "Thiếu ?q=" });
-  res.json(await handleSearchMusic({ query: q, limit: 5 }));
+  const song = await searchZingSong(q);
+  res.json({ success: !!song, song });
 });
 
-app.get("/play", async (req, res) => {
-  const id = req.query.id;
-  if (!id) return res.json({ error: "Thiếu ?id=" });
-  res.redirect(await getDirectStreamUrl(id));
-});
-
-// REST API: Lấy link stream trực tiếp
-app.get("/stream", async (req, res) => {
-  const id = req.query.id;
-  if (!id) return res.json({ error: "Thiếu ?id=" });
-  res.json(await handleGetStreamUrl({ encodeId: id }));
-});
-
-// REST API: Lấy thông tin bài hát
-app.get("/info", async (req, res) => {
-  const id = req.query.id;
-  if (!id) return res.json({ error: "Thiếu ?id=" });
-  res.json(await handleGetSongInfo({ encodeId: id }));
-});
-
-// REST API: Lấy lời bài hát
-app.get("/lyrics", async (req, res) => {
-  const id = req.query.id;
-  if (!id) return res.json({ error: "Thiếu ?id=" });
-  res.json(await handleGetLyrics({ encodeId: id }));
-});
-
-// Debug endpoint
-app.get("/debug/bonion", async (req, res) => {
-  console.log("[DEBUG] Checking Bonion API connectivity...");
-  try {
-    const servers = await fetchBonionServers();
-    let totalTools = 0;
-    for (const server of servers) {
-      if (server.enabled && Array.isArray(server.tools)) {
-        totalTools += server.tools.filter(t => t.enabled).length;
-      }
-    }
-    res.json({
-      status: "OK",
-      servers: servers.length,
-      bonionTools: totalTools,
-      serverDetails: servers.map(s => ({
-        name: s.name,
-        enabled: s.enabled,
-        tools: Array.isArray(s.tools) ? s.tools.filter(t => t.enabled).length : 0
-      })),
-      timestamp: new Date().toISOString()
-    });
-  } catch (e) {
-    res.status(500).json({
-      status: "ERROR",
-      error: e.message,
-      timestamp: new Date().toISOString()
-    });
-  }
-});
-
-app.get("/health", (req, res) => {
-  res.json({ status: "ok", devices: connectedDevices.size, uptime: Math.floor(process.uptime()) + "s" });
-});
-
-// ─── Start ─────────────────────────────────────────────────────────────────────
+// ─── Khởi động Server ──────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, async () => {
+app.listen(PORT, "0.0.0.0", () => {
   console.log("========================================");
-  console.log(" 🎵 VN Music MCP Server v3.0");
-  console.log(`    http://localhost:${PORT}`);
-  console.log("========================================");
-  console.log(" 🎶 Music Tools (6):");
-  console.log(`   search_music / play_music / get_stream_url`);
-  console.log(`   get_song_info / get_lyrics / get_top_charts`);
-  console.log("----------------------------------------");
-
-  // Pre-load bonion tools
-  const bonionTools = await getAllBonionMCPTools();
-  console.log(` 🧠 Bonion AI Tools: ${bonionTools.length}`);
-  console.log(` 📊 Tổng cộng: ${6 + bonionTools.length} tools`);
-  console.log("----------------------------------------");
-  console.log(" REST API:");
-  console.log(`   POST /api/connect        GET /api/devices`);
-  console.log(`   GET  /api/saved-devices  POST /api/save-device`);
-  console.log(`   POST /api/remove-saved-device`);
-  console.log(`   GET  /api/tools          GET /search?q=xxx`);
-  console.log(`   GET  /play?id=xxx        GET /stream?id=xxx`);
-  console.log(`   GET  /info?id=xxx        GET /lyrics?id=xxx`);
+  console.log(" 🎵 Xiaozhi Zing MP3 MCP Server v3.5 (Cloud 24/7)");
+  console.log(` 🌐 Server chạy trên cổng: ${PORT}`);
   console.log("========================================");
 
-  // ─── Auto-reconnect saved devices ────────────────────────────────────────────
-  const savedDevices = loadSavedDevices();
-  if (savedDevices.length > 0) {
-    console.log(`\n[storage] 📂 Tìm thấy ${savedDevices.length} thiết bị đã lưu`);
-    for (const dev of savedDevices) {
-      if (dev.autoConnect !== false) {
-        console.log(`[storage] 🔄 Tự động kết nối: ${dev.deviceName}`);
-        try {
-          connectToXiaozhi(dev.deviceName, dev.wssUrl);
-        } catch (e) {
-          console.error(`[storage] ❌ Lỗi kết nối ${dev.deviceName}: ${e.message}`);
-        }
-        // Delay giữa các kết nối để tránh overload
-        await new Promise(r => setTimeout(r, 1000));
-      } else {
-        console.log(`[storage] ⏸️ Bỏ qua (autoConnect tắt): ${dev.deviceName}`);
+  const saved = loadSavedDevices();
+  if (saved.length > 0) {
+    for (const dev of saved) {
+      if (dev.autoConnect !== false && dev.wssUrl) {
+        connectToXiaozhi(dev.deviceName, dev.wssUrl);
       }
     }
-    console.log(`[storage] ✅ Hoàn tất auto-reconnect\n`);
-  } else {
-    console.log(`\n[storage] 📂 Chưa có thiết bị nào được lưu`);
   }
 });

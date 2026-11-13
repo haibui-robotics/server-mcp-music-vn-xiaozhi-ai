@@ -264,26 +264,13 @@ async function handleToolCall(toolName, args) {
       return { content: [{ type: "text", text: `Không tìm thấy bài hát '${query}' trên Zing MP3.` }] };
     }
     const displayName = song.artist ? `${song.title} - ${song.artist}` : song.title;
-    console.log(`[Zing] Tìm thấy: ${displayName} (ID: ${song.id}). Đang lấy link stream...`);
+    console.log(`[Zing] Tìm thấy: ${displayName} (ID: ${song.id}). Chuyển cho thiết bị ESP32 phát trực tiếp.`);
     
-    const streamUrl = await getZingStreamUrl(song.id);
-    if (!streamUrl) {
-      return { content: [{ type: "text", text: `Bài hát '${displayName}' hiện không thể phát do bản quyền.` }] };
-    }
-    console.log(`[Zing] Lấy link stream thành công: ${streamUrl.substring(0, 60)}...`);
-
     return {
       content: [
         {
           type: "text",
-          text: `Đã tìm thấy bài hát '${displayName}'. Link stream: ${streamUrl}\nBẮT BUỘC hãy gọi ngay công cụ thiết bị self.music.play_song với tham số url='${streamUrl}' và song_name='${displayName}' để phát ra loa.`
-        },
-        {
-          type: "resource_link",
-          uri: RESOURCE_URI,
-          name: displayName,
-          description: streamUrl,
-          mimeType: "audio/mpeg"
+          text: `Đã tìm thấy bài hát '${displayName}'. BẮT BUỘC hãy gọi ngay công cụ thiết bị self.music.play_song với tham số song_name='${displayName}' để thiết bị tự động phát ra loa.`
         }
       ]
     };

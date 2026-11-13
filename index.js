@@ -1,5 +1,5 @@
 /**
- * Xiaozhi Zing MP3 MCP Server - Cloud 24/7 Edition
+ * Xiaozhi Zing MP3 MCP Server - Cloud 24/7 Edition v3.6
  * Native Zing MP3 HMAC-SHA512 direct resolver + Model Context Protocol
  * Tương thích 100% với Chatbox Xiaozhi ESP32, Render.com, UptimeRobot.
  */
@@ -132,14 +132,14 @@ async function getZingStreamUrl(songId) {
   const url = `https://zingmp3.vn${path}?id=${songId}&ctime=${ctime}&version=${ZING_VERSION}&apiKey=${ZING_API_KEY}&sig=${sig}`;
 
   try {
-    const resp = await fetch(url, {
-      headers: {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-        "Cookie": zingCookie
-      },
-      timeout: 8000
-    });
+    const headers = {
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+    };
+    if (zingCookie) headers["Cookie"] = zingCookie;
+
+    const resp = await fetch(url, { headers, timeout: 8000 });
     const data = await resp.json();
+    console.log(`[Zing] Phản hồi Zing MP3 (${songId}): err=${data?.err}`);
     if (data?.err === 0 && data?.data) {
       const audioUrl = data.data["128"] || data.data["320"];
       if (audioUrl) {
@@ -154,6 +154,8 @@ async function getZingStreamUrl(songId) {
           return audioUrl;
         }
       }
+    } else {
+      console.warn(`[Zing] Zing MP3 không cấp audioUrl cho ${songId}:`, JSON.stringify(data));
     }
   } catch (e) {
     console.error("[Zing] Stream URL error:", e.message);
@@ -185,17 +187,17 @@ async function readHttpChunk(url, start = 0, end = 0) {
   }
 }
 
-// ─── MCP Definitions ──────────────────────────────────────────────────────────
+// ─── MCP Definitions (CHỈ 2 TOOL DUY NHẤT ĐỂ TRÁNH CONFLICT) ───────────────────
 const TOOLS_LIST = [
   {
     name: "play_song",
-    description: "Phát bài hát Việt Nam hoặc quốc tế được yêu cầu ra loa thiết bị. BẮT BUỘC dùng công cụ này khi người dùng muốn nghe nhạc hoặc mở bài hát.",
+    description: "Phát bài hát Việt Nam hoặc quốc tế được yêu cầu ra loa thiết bị. BẮT BUỘC dùng công cụ này khi người dùng muốn nghe nhạc hoặc mở bài hát tiếng Việt.",
     inputSchema: {
       type: "object",
       properties: {
         query: {
           type: "string",
-          description: "Tên bài hát hoặc tên ca sĩ cần phát (ví dụ: 'Một con vịt', 'Cắt Đôi Nỗi Sầu', 'Lạc Trôi Sơn Tùng')"
+          description: "Tên bài hát hoặc ca sĩ cần phát (ví dụ: 'Một con vịt', 'Con cò bé bé', 'Cắt Đôi Nỗi Sầu', 'Lạc Trôi Sơn Tùng')"
         }
       },
       required: ["query"]
@@ -203,7 +205,7 @@ const TOOLS_LIST = [
   },
   {
     name: "search_song",
-    description: "Tìm kiếm bài hát hoặc danh sách ca khúc Việt Nam",
+    description: "Tìm kiếm bài hát tiếng Việt trên Zing MP3",
     inputSchema: {
       type: "object",
       properties: {
@@ -211,28 +213,6 @@ const TOOLS_LIST = [
           type: "string",
           description: "Từ khóa bài hát hoặc ca sĩ cần tìm"
         }
-      },
-      required: ["query"]
-    }
-  },
-  {
-    name: "play_music",
-    description: "Phát bài hát Việt Nam hoặc quốc tế ra loa thiết bị",
-    inputSchema: {
-      type: "object",
-      properties: {
-        query: { type: "string", description: "Tên bài hát hoặc tên ca sĩ cần phát" }
-      },
-      required: ["query"]
-    }
-  },
-  {
-    name: "search_music",
-    description: "Tìm kiếm bài hát hoặc ca khúc Việt Nam",
-    inputSchema: {
-      type: "object",
-      properties: {
-        query: { type: "string", description: "Từ khóa bài hát cần tìm" }
       },
       required: ["query"]
     }
@@ -267,7 +247,7 @@ async function handleToolCall(toolName, args) {
     if (!streamUrl) {
       return { content: [{ type: "text", text: `Bài hát '${displayName}' hiện không thể phát do bản quyền.` }] };
     }
-    console.log(`[Zing] Link stream: ${streamUrl.substring(0, 60)}...`);
+    console.log(`[Zing] Lấy link stream thành công: ${streamUrl.substring(0, 60)}...`);
 
     return {
       content: [
@@ -317,7 +297,7 @@ async function handleXiaozhiMessage(ws, raw, deviceName) {
       result = {
         protocolVersion: "2024-11-05",
         capabilities: { tools: {}, resources: {} },
-        serverInfo: { name: "xiaozhi-vn-music-streamer", version: "3.5.0" }
+        serverInfo: { name: "xiaozhi-vn-music-streamer", version: "3.6.0" }
       };
     } else if (method === "tools/list") {
       result = { tools: TOOLS_LIST };
@@ -476,11 +456,41 @@ app.get("/search", async (req, res) => {
   res.json({ success: !!song, song });
 });
 
+// REST API Stream Debug endpoint
+app.get("/stream-debug", async (req, res) => {
+  const q = req.query.q || "con cò bé bé";
+  const song = await searchZingSong(q);
+  if (!song) return res.json({ error: "Song not found" });
+
+  await ensureZingCookie();
+  const ctime = Math.floor(Date.now() / 1000).toString();
+  const path = "/api/v2/song/get/streaming";
+  const msg = `ctime=${ctime}id=${song.id}version=${ZING_VERSION}`;
+  const hash256 = crypto.createHash("sha256").update(msg, "utf8").digest("hex");
+  const sig = crypto.createHmac("sha512", ZING_SECRET_KEY).update(path + hash256, "utf8").digest("hex");
+  const url = `https://zingmp3.vn${path}?id=${song.id}&ctime=${ctime}&version=${ZING_VERSION}&apiKey=${ZING_API_KEY}&sig=${sig}`;
+
+  try {
+    const headers = { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" };
+    if (zingCookie) headers["Cookie"] = zingCookie;
+    const resp = await fetch(url, { headers });
+    const json = await resp.json();
+    res.json({
+      song,
+      cookie: zingCookie,
+      zingResponse: json,
+      streamUrl: json?.data?.["128"] || json?.data?.["320"] || ""
+    });
+  } catch (e) {
+    res.json({ error: e.message });
+  }
+});
+
 // ─── Khởi động Server ──────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, "0.0.0.0", () => {
   console.log("========================================");
-  console.log(" 🎵 Xiaozhi Zing MP3 MCP Server v3.5 (Cloud 24/7)");
+  console.log(" 🎵 Xiaozhi Zing MP3 MCP Server v3.6 (Cloud 24/7)");
   console.log(` 🌐 Server chạy trên cổng: ${PORT}`);
   console.log("========================================");
 

@@ -83,7 +83,12 @@ async function ensureZingCookie() {
   if (!zingCookie || (Date.now() - zingCookieTime > 1800000)) {
     try {
       const resp = await fetch("https://zingmp3.vn", {
-        headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" },
+        headers: {
+          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+          "X-Forwarded-For": "118.69.182.1",
+          "X-Real-IP": "118.69.182.1",
+          "Client-IP": "118.69.182.1"
+        },
         timeout: 6000
       });
       const rawCookies = resp.headers.raw() ? resp.headers.raw()["set-cookie"] : null;
@@ -148,7 +153,10 @@ async function getZingStreamUrl(songId) {
 
   try {
     const headers = {
-      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+      "X-Forwarded-For": "118.69.182.1",
+      "X-Real-IP": "118.69.182.1",
+      "Client-IP": "118.69.182.1"
     };
     if (zingCookie) headers["Cookie"] = zingCookie;
 
